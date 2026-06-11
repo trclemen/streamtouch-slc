@@ -10,6 +10,5 @@ services:
       - SHIM_PORT=8300
       - MA_HOST=192.168.0.x        # IP of your Music Assistant server
       - MA_PORT=8095
-      - MA_TOKEN=your_token_here   # Music Assistant bearer token
     volumes:
       - ./data:/data
