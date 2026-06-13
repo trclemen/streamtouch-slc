@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 StreamTouch UPnP Shim
@@ -28,7 +27,8 @@ SHIM_HOST = os.environ.get("SHIM_HOST", "192.168.0.254")
 SHIM_PORT = int(os.environ.get("SHIM_PORT", "8300"))
 SHIM_UUID = os.environ.get("SHIM_UUID", "streamtouch-upnp-0000-0000-000000000001")
 DATA_DIR  = os.environ.get("DATA_DIR",  "/data")
-PRESETS_FILE = os.path.join(DATA_DIR, "presets.json")
+PRESETS_FILE        = os.path.join(DATA_DIR, "presets.json")
+DEVICE_PRESETS_FILE = os.path.join(DATA_DIR, "device_presets.json")
 
 # Fixed token — ST10/Wave store this after device registration
 SHIM_TOKEN = "bst_streamtouchlocalaccesstoken00001"
@@ -56,6 +56,21 @@ def save_presets(presets):
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(PRESETS_FILE, "w") as f:
         json.dump(presets, f, indent=2)
+
+# ─── Device preset persistence ────────────────────────────────────────────────
+# Stores presets per device so they survive speaker power cycles.
+# Keyed by device_id → slot → preset data.
+
+def load_device_presets():
+    if os.path.exists(DEVICE_PRESETS_FILE):
+        with open(DEVICE_PRESETS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_device_presets(data):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(DEVICE_PRESETS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
 # ─── UPnP XML definitions ─────────────────────────────────────────────────────
 
@@ -248,9 +263,9 @@ def build_soap_browse_response(didl_content, number_returned, total_matches):
 # ─── Recent XML builder ───────────────────────────────────────────────────────
 
 def build_recent_xml(recent_id, item):
-    now      = "2026-01-01T00:00:00.000+00:00"
-    name     = escape_xml(item.get("name", ""))
-    location = escape_xml(item.get("location", ""))
+    now          = "2026-01-01T00:00:00.000+00:00"
+    name         = escape_xml(item.get("name", ""))
+    location     = escape_xml(item.get("location", ""))
     content_type = escape_xml(item.get("contentItemType", "stationurl"))
     last_played  = item.get("lastplayedat", now)
     return (
@@ -276,27 +291,52 @@ def build_recent_xml(recent_id, item):
         f'</recent>'
     )
 
+# ─── Preset XML builder ───────────────────────────────────────────────────────
+
+def build_preset_xml(slot, preset):
+    now          = "2026-01-01T00:00:00.000+00:00"
+    name         = escape_xml(preset.get("name", ""))
+    location     = escape_xml(preset.get("location", ""))
+    content_type = escape_xml(preset.get("contentItemType", "stationurl"))
+    return (
+        f'  <preset buttonNumber="{slot}">\n'
+        f'    <containerArt></containerArt>\n'
+        f'    <contentItemType>{content_type}</contentItemType>\n'
+        f'    <createdOn>{now}</createdOn>\n'
+        f'    <location>{location}</location>\n'
+        f'    <name>{name}</name>\n'
+        f'    <source id="ST_LIR_001" type="Audio">\n'
+        f'      <createdOn>{now}</createdOn>\n'
+        f'      <credential type="token">streamtouch-lir-token</credential>\n'
+        f'      <name></name>\n'
+        f'      <sourceproviderid>11</sourceproviderid>\n'
+        f'      <sourcename>LOCAL_INTERNET_RADIO</sourcename>\n'
+        f'      <sourceSettings/>\n'
+        f'      <updatedOn>{now}</updatedOn>\n'
+        f'      <username></username>\n'
+        f'    </source>\n'
+        f'    <updatedOn>{now}</updatedOn>\n'
+        f'    <username>{name}</username>\n'
+        f'  </preset>\n'
+    )
+
 # ─── Stream URL resolver ──────────────────────────────────────────────────────
 
 def get_ma_stream_url(ma_uri):
     """
     Resolve a MA provider URI to a direct playable stream URL.
-
     For radiobrowser URIs: query RadioBrowser public API directly.
     For tunein URIs: query TuneIn opml endpoint.
     For direct http URLs: return as-is.
     Falls back to MA API for other provider URIs if token available.
     """
     try:
-        # Direct HTTP URL — use as-is
         if ma_uri.startswith("http"):
             log.info(f"Direct stream URL: {ma_uri}")
             return ma_uri
 
-        # RadioBrowser URI: radiobrowser://radio/<uuid>
-        # MA may append instance ID e.g. radiobrowser--abc://radio/<uuid>
         if "radiobrowser" in ma_uri:
-            parts = ma_uri.split("/")
+            parts        = ma_uri.split("/")
             station_uuid = parts[-1]
             log.info(f"Resolving RadioBrowser UUID: {station_uuid}")
             api_url = (
@@ -322,11 +362,9 @@ def get_ma_stream_url(ma_uri):
             )
             return None
 
-        # TuneIn URI: tunein--instanceid://radio/s<id>
-        # MA appends instance ID to provider name e.g. tunein--6tdRAKyb
         if "tunein" in ma_uri:
-            parts = ma_uri.split("/")
-            station_id = parts[-1]  # e.g. s220687
+            parts      = ma_uri.split("/")
+            station_id = parts[-1]
             log.info(f"Resolving TuneIn station: {station_id}")
             opml_url = (
                 f"https://opml.radiotime.com/Tune.ashx"
@@ -349,7 +387,6 @@ def get_ma_stream_url(ma_uri):
             )
             return None
 
-        # Fallback — try MA API for unknown provider URIs
         if MA_TOKEN:
             headers = {
                 "Authorization": f"Bearer {MA_TOKEN}",
@@ -499,22 +536,29 @@ def streaming_source_providers():
     )
 
 @app.route("/streaming/account/<account_id>/full", methods=["GET"])
+@app.route("/streaming/account/<account_id>/full", methods=["GET"])
 def streaming_account_full(account_id):
     auth = request.headers.get("Authorization", "none")
     log.info(
         f"Account full: id={account_id} "
         f"auth={auth[:40]} from {request.remote_addr}"
     )
-    now = "2026-01-01T00:00:00.000+00:00"
-    devices_xml = ""
+    now            = "2026-01-01T00:00:00.000+00:00"
+    device_presets = load_device_presets()
+
+    # Build device list from recent_store if available
+    # otherwise create a default device entry for the requester
     if recent_store:
+        devices_xml = ""
         for device_id, device_recents in recent_store.items():
             recents_items_xml = ""
             for rid, item in list(device_recents.items())[-5:]:
                 name        = escape_xml(item.get("name", ""))
                 last_played = item.get("lastplayedat", now)
                 location    = escape_xml(item.get("location", ""))
-                ctype       = escape_xml(item.get("contentItemType", "stationurl"))
+                ctype       = escape_xml(
+                    item.get("contentItemType", "stationurl")
+                )
                 recents_items_xml += (
                     f'      <recent id="{rid}">\n'
                     f'        <contentItemType>{ctype}</contentItemType>\n'
@@ -536,29 +580,65 @@ def streaming_account_full(account_id):
                     f'        <updatedOn>{now}</updatedOn>\n'
                     f'      </recent>\n'
                 )
+
+            # Look up presets by device MAC
+            slots       = device_presets.get(device_id, {})
+            presets_xml = ""
+            for slot, preset in slots.items():
+                presets_xml += build_preset_xml(slot, preset)
+            presets_block = (
+                f'      <presets>\n{presets_xml}      </presets>\n'
+                if presets_xml else ''
+            )
+
             devices_xml += (
                 f'    <device deviceid="{device_id}">\n'
                 f'      <createdOn>{now}</createdOn>\n'
                 f'      <ipaddress>{request.remote_addr}</ipaddress>\n'
                 f'      <name></name>\n'
                 f'      <updatedOn>{now}</updatedOn>\n'
-                f'      <presets/>\n'
+                f'{presets_block}'
                 f'      <recents>\n'
                 f'{recents_items_xml}'
                 f'      </recents>\n'
                 f'    </device>\n'
             )
     else:
-        devices_xml = (
-            f'    <device deviceid="DEFAULT">\n'
-            f'      <createdOn>{now}</createdOn>\n'
-            f'      <ipaddress>{request.remote_addr}</ipaddress>\n'
-            f'      <name></name>\n'
-            f'      <updatedOn>{now}</updatedOn>\n'
-            f'      <presets/>\n'
-            f'      <recents/>\n'
-            f'    </device>\n'
-        )
+        # No recents in memory — look up presets across all known devices
+        # The requesting speaker's MAC is not known here from IP alone
+        # so include ALL stored device presets as separate device entries
+        # This covers the cold start case after SLC restart
+        devices_xml = ""
+        if device_presets:
+            for device_id, slots in device_presets.items():
+                presets_xml = ""
+                for slot, preset in slots.items():
+                    presets_xml += build_preset_xml(slot, preset)
+                presets_block = (
+                    f'      <presets>\n{presets_xml}      </presets>\n'
+                    if presets_xml else ''
+                )
+                devices_xml += (
+                    f'    <device deviceid="{device_id}">\n'
+                    f'      <createdOn>{now}</createdOn>\n'
+                    f'      <ipaddress>{request.remote_addr}</ipaddress>\n'
+                    f'      <name></name>\n'
+                    f'      <updatedOn>{now}</updatedOn>\n'
+                    f'{presets_block}'
+                    f'      <recents/>\n'
+                    f'    </device>\n'
+                )
+        else:
+            devices_xml = (
+                f'    <device deviceid="DEFAULT">\n'
+                f'      <createdOn>{now}</createdOn>\n'
+                f'      <ipaddress>{request.remote_addr}</ipaddress>\n'
+                f'      <name></name>\n'
+                f'      <updatedOn>{now}</updatedOn>\n'
+                f'      <recents/>\n'
+                f'    </device>\n'
+            )
+
     response_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
         f'<account id="{account_id}">\n'
@@ -607,8 +687,8 @@ def streaming_account_device(account_id, device_id=None):
         f"device={device_id} method={request.method} "
         f"from {request.remote_addr}"
     )
-    now        = "2026-01-01T00:00:00.000+00:00"
-    shim_base  = f"http://{SHIM_HOST}:{SHIM_PORT}"
+    now       = "2026-01-01T00:00:00.000+00:00"
+    shim_base = f"http://{SHIM_HOST}:{SHIM_PORT}"
     response_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
         f'<device deviceid="{device_id}">\n'
@@ -691,23 +771,27 @@ def streaming_account_recent_add(account_id, device_id):
         f"Recent POST: account={account_id} device={device_id} "
         f"from {request.remote_addr} body={body[:300]}"
     )
-    name               = ""
-    location           = ""
-    content_item_type  = "stationurl"
-    last_played_at     = "2026-01-01T00:00:00.000+00:00"
-    name_match         = re.search(r'<name>(.*?)</name>', body)
+    name              = ""
+    location          = ""
+    content_item_type = "stationurl"
+    last_played_at    = "2026-01-01T00:00:00.000+00:00"
+    name_match = re.search(r'<name>(.*?)</name>', body)
     if name_match:
         name = name_match.group(1)
+
     location_match = re.search(r'<location>(.*?)</location>', body)
     if location_match:
-        location = location_match.group(1)
+        location = location_match.group(1)  # raw — no escape_xml here
+
     type_match = re.search(r'<contentItemType>(.*?)</contentItemType>', body)
     if type_match:
         content_item_type = type_match.group(1)
     played_match = re.search(r'<lastplayedat>(.*?)</lastplayedat>', body)
     if played_match:
         last_played_at = played_match.group(1)
-    log.info(f"Recent stored: name='{name}' location='{location[:60]}'")
+    log.info(
+        f"Recent stored: name='{name}' location='{location[:60]}'"
+    )
     recent_id = str(int(time.time() * 1000))
     if device_id not in recent_store:
         recent_store[device_id] = {}
@@ -760,13 +844,38 @@ def streaming_account_recent_get(account_id, device_id, recent_id):
     methods=["GET"]
 )
 def streaming_account_presets(account_id, device_id):
+    log.info(
+        f"Presets GET: account={account_id} device={device_id} "
+        f"from {request.remote_addr}"
+    )
+    device_presets = load_device_presets()
+    slots          = device_presets.get(device_id, {})
+    if not slots:
+        log.info(f"No stored presets for device {device_id}")
+        return Response(
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<presets/>',
+            status=200,
+            mimetype="application/vnd.bose.streaming-v1.2+xml"
+        )
+    presets_xml = ""
+    for slot, preset in slots.items():
+        presets_xml += build_preset_xml(slot, preset)
+    response_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        f'<presets>\n{presets_xml}</presets>'
+    )
+    log.info(f"Returning {len(slots)} preset(s) for device {device_id}")
     return Response(
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<presets/>',
+        response_xml,
         status=200,
         mimetype="application/vnd.bose.streaming-v1.2+xml"
     )
 
+@app.route(
+    "/streaming/account/<account_id>/device/<device_id>/preset/<int:button_number>",
+    methods=["GET", "PUT", "DELETE"]
+)
 @app.route(
     "/streaming/account/<account_id>/device/<device_id>/preset/<int:button_number>",
     methods=["GET", "PUT", "DELETE"]
@@ -778,48 +887,64 @@ def streaming_account_preset(account_id, device_id, button_number):
         f"device={device_id} method={request.method} "
         f"from {request.remote_addr} body={body[:200]}"
     )
+
+    # Load device presets once at top — used by all method branches
+    device_presets = load_device_presets()
+
     if request.method == "DELETE":
+        if device_id in device_presets:
+            device_presets[device_id].pop(str(button_number), None)
+            save_device_presets(device_presets)
+            log.info(
+                f"Preset {button_number} deleted for device {device_id}"
+            )
         return Response(
-            '', status=200,
+            '',
+            status=200,
             mimetype="application/vnd.bose.streaming-v1.2+xml"
         )
+
     if request.method == "PUT":
-        now        = "2026-01-01T00:00:00.000+00:00"
-        shim_base  = f"http://{SHIM_HOST}:{SHIM_PORT}"
-        name       = ""
-        location   = ""
+        now          = "2026-01-01T00:00:00.000+00:00"
+        shim_base    = f"http://{SHIM_HOST}:{SHIM_PORT}"
+        name         = ""
+        location     = ""
         content_type = "stationurl"
+
         name_match = re.search(r'<name>(.*?)</name>', body)
         if name_match:
-            name = escape_xml(name_match.group(1))
+            name = name_match.group(1)
+
         location_match = re.search(r'<location>(.*?)</location>', body)
         if location_match:
-            location = escape_xml(location_match.group(1))
-        type_match = re.search(r'<contentItemType>(.*?)</contentItemType>', body)
+            location = location_match.group(1)
+
+        type_match = re.search(
+            r'<contentItemType>(.*?)</contentItemType>', body
+        )
         if type_match:
-            content_type = escape_xml(type_match.group(1))
-        log.info(f"Preset PUT accepted: slot={button_number} name='{name}'")
+            content_type = type_match.group(1)
+
+        log.info(
+            f"Preset PUT accepted: slot={button_number} name='{name}'"
+        )
+
+        if device_id not in device_presets:
+            device_presets[device_id] = {}
+        device_presets[device_id][str(button_number)] = {
+            "name":            name,
+            "location":        location,
+            "contentItemType": content_type
+        }
+        save_device_presets(device_presets)
+        log.info(
+            f"Preset {button_number} stored for device {device_id}: {name}"
+        )
+
+        preset_data  = device_presets[device_id][str(button_number)]
         response_xml = (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-            f'<preset buttonNumber="{button_number}">\n'
-            f'  <containerArt></containerArt>\n'
-            f'  <contentItemType>{content_type}</contentItemType>\n'
-            f'  <createdOn>{now}</createdOn>\n'
-            f'  <location>{location}</location>\n'
-            f'  <name>{name}</name>\n'
-            f'  <source id="ST_LIR_001" type="Audio">\n'
-            f'    <createdOn>{now}</createdOn>\n'
-            f'    <credential type="token">streamtouch-lir-token</credential>\n'
-            f'    <name></name>\n'
-            f'    <sourceproviderid>11</sourceproviderid>\n'
-            f'    <sourcename>LOCAL_INTERNET_RADIO</sourcename>\n'
-            f'    <sourceSettings/>\n'
-            f'    <updatedOn>{now}</updatedOn>\n'
-            f'    <username></username>\n'
-            f'  </source>\n'
-            f'  <updatedOn>{now}</updatedOn>\n'
-            f'  <username>{name}</username>\n'
-            f'</preset>'
+            + build_preset_xml(button_number, preset_data).strip()
         )
         return Response(
             response_xml,
@@ -833,11 +958,25 @@ def streaming_account_preset(account_id, device_id, button_number):
                 "METHOD_NAME": "updatePreset"
             }
         )
+
+    # GET individual preset
+    slots  = device_presets.get(device_id, {})
+    preset = slots.get(str(button_number))
+    if not preset:
+        return Response(
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<status><message>Not found</message>'
+            f'<status-code>404</status-code></status>',
+            status=404,
+            mimetype="application/vnd.bose.streaming-v1.2+xml"
+        )
+    response_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        + build_preset_xml(button_number, preset).strip()
+    )
     return Response(
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        f'<status><message>Not found</message>'
-        f'<status-code>404</status-code></status>',
-        status=404,
+        response_xml,
+        status=200,
         mimetype="application/vnd.bose.streaming-v1.2+xml"
     )
 
@@ -858,7 +997,8 @@ def streaming_account_device_group(account_id, device_id):
 )
 def streaming_provider_settings(account_id):
     return Response(
-        '', status=200,
+        '',
+        status=200,
         mimetype="application/vnd.bose.streaming-v1.2+xml",
         headers={"METHOD_NAME": "getProviderSettings"}
     )
@@ -869,7 +1009,8 @@ def streaming_provider_settings(account_id):
 )
 def streaming_device_token(device_id):
     return Response(
-        '', status=200,
+        '',
+        status=200,
         headers={"Authorization": f"Bearer {SHIM_TOKEN}"}
     )
 
@@ -909,7 +1050,9 @@ def streaming_catchall(subpath):
 @app.route("/stats", methods=["GET", "POST"])
 @app.route("/stats/", methods=["GET", "POST"])
 def stats():
-    return Response('{"status":"ok"}', status=200, mimetype="application/json")
+    return Response(
+        '{"status":"ok"}', status=200, mimetype="application/json"
+    )
 
 @app.route("/stats/v1/blacklist/<device_id>", methods=["GET"])
 def stats_blacklist(device_id):
@@ -926,7 +1069,9 @@ def stats_v1_catchall(subpath):
         f"Stats v1 /{subpath} from {request.remote_addr} "
         f"method={request.method} body={body[:100]}"
     )
-    return Response('{"status":"ok"}', status=200, mimetype="application/json")
+    return Response(
+        '{"status":"ok"}', status=200, mimetype="application/json"
+    )
 
 @app.route("/updates/soundtouch")
 @app.route("/updates/soundtouch/<path:subpath>")
@@ -950,17 +1095,12 @@ def orion_station():
         padding = 4 - len(data) % 4
         if padding != 4:
             data += "=" * padding
-        decoded = base64.b64decode(data).decode("utf-8")
+        decoded    = base64.b64decode(data).decode("utf-8")
         station    = json.loads(decoded)
         name       = station.get("name", "Unknown")
         stream_url = station.get("streamUrl", "")
         image_url  = station.get("imageUrl", "")
-
         log.info(f"Orion station: {name} → {stream_url}")
-
-        # If stream_url is an MA provider URI (not a direct http URL)
-        # resolve it to a real stream URL before returning to speaker.
-        # The speaker cannot play provider scheme URIs directly.
         if stream_url and not stream_url.startswith("http"):
             log.info(f"Resolving MA URI to stream URL: {stream_url}")
             resolved = get_ma_stream_url(stream_url)
@@ -972,7 +1112,6 @@ def orion_station():
                     f"Could not resolve stream URL for: {stream_url}"
                 )
                 return jsonify({"error": "stream unavailable"}), 503
-
         response_data = {
             "audio": {
                 "hasPlaylist": False,
@@ -1063,10 +1202,17 @@ def content_directory_control(shim_id):
     body    = request.data.decode("utf-8")
     log.info(f"ContentDirectory request: {body[:300]}")
     presets = load_presets()
-    object_id_match  = re.search(r'<ObjectID[^>]*>(.*?)</ObjectID>', body)
-    browse_flag_match = re.search(r'<BrowseFlag[^>]*>(.*?)</BrowseFlag>', body)
-    object_id  = object_id_match.group(1).strip()  if object_id_match  else "0"
-    browse_flag = browse_flag_match.group(1).strip() if browse_flag_match else "BrowseDirectChildren"
+    object_id_match   = re.search(r'<ObjectID[^>]*>(.*?)</ObjectID>', body)
+    browse_flag_match = re.search(
+        r'<BrowseFlag[^>]*>(.*?)</BrowseFlag>', body
+    )
+    object_id   = (
+        object_id_match.group(1).strip() if object_id_match else "0"
+    )
+    browse_flag = (
+        browse_flag_match.group(1).strip()
+        if browse_flag_match else "BrowseDirectChildren"
+    )
     log.info(f"ObjectID={object_id} BrowseFlag={browse_flag}")
     if object_id == "0":
         content = build_didl_container(
@@ -1081,7 +1227,9 @@ def content_directory_control(shim_id):
     elif object_id == "st_music":
         items = []
         for preset_id, preset in presets.items():
-            stream_url = f"http://{SHIM_HOST}:{SHIM_PORT}/stream/{preset_id}"
+            stream_url = (
+                f"http://{SHIM_HOST}:{SHIM_PORT}/stream/{preset_id}"
+            )
             items.append(build_didl_item(
                 preset_id, "st_music",
                 preset.get("name", "Unknown"),
@@ -1090,13 +1238,17 @@ def content_directory_control(shim_id):
             ))
         content = "".join(items)
         return Response(
-            build_soap_browse_response(content, len(items), len(items)),
+            build_soap_browse_response(
+                content, len(items), len(items)
+            ),
             mimetype="text/xml"
         )
     elif object_id in presets:
         preset     = presets[object_id]
-        stream_url = f"http://{SHIM_HOST}:{SHIM_PORT}/stream/{object_id}"
-        content    = build_didl_item(
+        stream_url = (
+            f"http://{SHIM_HOST}:{SHIM_PORT}/stream/{object_id}"
+        )
+        content = build_didl_item(
             object_id, "st_music",
             preset.get("name", "Unknown"),
             stream_url,
@@ -1125,17 +1277,19 @@ def stream_preset(preset_id):
     stream_url = get_ma_stream_url(ma_uri)
     if stream_url:
         log.info(f"Redirecting to: {stream_url}")
-        return Response(status=302, headers={"Location": stream_url})
+        return Response(
+            status=302, headers={"Location": stream_url}
+        )
     return Response("Stream unavailable", status=503)
 
 # ─── StreamTouch REST API ─────────────────────────────────────────────────────
 
 @app.route("/api/preset", methods=["POST"])
 def register_preset():
-    data     = request.json
-    name     = data.get("name", "Unknown")
-    ma_uri   = data.get("ma_uri", "")
-    artwork  = data.get("artwork")
+    data    = request.json
+    name    = data.get("name", "Unknown")
+    ma_uri  = data.get("ma_uri", "")
+    artwork = data.get("artwork")
     if not ma_uri:
         return jsonify({"error": "ma_uri required"}), 400
     preset_id = "st_" + uuid.uuid5(uuid.NAMESPACE_URL, ma_uri).hex[:16]
@@ -1157,12 +1311,12 @@ def register_preset():
         f"/orion/station?data={station_data}"
     )
     return jsonify({
-        "object_id":    preset_id,
+        "object_id":      preset_id,
         "source_account": f"{SHIM_UUID}/0",
-        "shim_host":    SHIM_HOST,
-        "shim_port":    SHIM_PORT,
-        "orion_url":    orion_url,
-        "upnp_location": (
+        "shim_host":      SHIM_HOST,
+        "shim_port":      SHIM_PORT,
+        "orion_url":      orion_url,
+        "upnp_location":  (
             f"http://{SHIM_HOST}:{SHIM_PORT}/stream/{preset_id}"
         )
     })
@@ -1189,6 +1343,9 @@ def health():
         "ma_host":        MA_HOST,
         "ma_port":        MA_PORT,
         "preset_count":   len(load_presets()),
+        "device_preset_count": sum(
+            len(v) for v in load_device_presets().values()
+        ),
         "recent_devices": list(recent_store.keys()),
         "registry_url_v1": (
             f"http://{SHIM_HOST}:{SHIM_PORT}/bmx/registry/v1/services"
@@ -1221,9 +1378,9 @@ def advertise_mdns():
             addresses=[local_ip],
             port=SHIM_PORT,
             properties={
-                b"deviceType":  b"urn:schemas-upnp-org:device:MediaServer:1",
+                b"deviceType":   b"urn:schemas-upnp-org:device:MediaServer:1",
                 b"friendlyName": b"StreamTouch Music Assistant",
-                b"uuid":        SHIM_UUID.encode(),
+                b"uuid":         SHIM_UUID.encode(),
                 b"location": (
                     f"http://{SHIM_HOST}:{SHIM_PORT}/DeviceDescription.xml"
                 ).encode()
@@ -1316,7 +1473,9 @@ def handle_ssdp_msearch():
                         )
                         resp_sock.sendto(response, addr)
                         resp_sock.close()
-                        log.info(f"M-SEARCH response sent to {addr[0]}")
+                        log.info(
+                            f"M-SEARCH response sent to {addr[0]}"
+                        )
             except Exception as e:
                 log.error(f"M-SEARCH receive error: {e}")
     except Exception as e:
@@ -1352,8 +1511,9 @@ if __name__ == "__main__":
         f"http://{SHIM_HOST}:{SHIM_PORT}/orion"
     )
 
-    threading.Thread(target=advertise_mdns,       daemon=True).start()
-    threading.Thread(target=advertise_ssdp,       daemon=True).start()
-    threading.Thread(target=handle_ssdp_msearch,  daemon=True).start()
+    threading.Thread(target=advertise_mdns,      daemon=True).start()
+    threading.Thread(target=advertise_ssdp,      daemon=True).start()
+    threading.Thread(target=handle_ssdp_msearch, daemon=True).start()
 
     app.run(host="0.0.0.0", port=SHIM_PORT, debug=False)
+
