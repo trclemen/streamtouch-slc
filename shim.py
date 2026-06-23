@@ -29,6 +29,7 @@ SHIM_UUID = os.environ.get("SHIM_UUID", "streamtouch-upnp-0000-0000-000000000001
 DATA_DIR  = os.environ.get("DATA_DIR",  "/data")
 PRESETS_FILE        = os.path.join(DATA_DIR, "presets.json")
 DEVICE_PRESETS_FILE = os.path.join(DATA_DIR, "device_presets.json")
+GROUPS_FILE = os.path.join(DATA_DIR, "groups.json")
 
 # Fixed token — ST10/Wave store this after device registration
 SHIM_TOKEN = "bst_streamtouchlocalaccesstoken00001"
@@ -41,7 +42,6 @@ log = logging.getLogger("streamtouch-upnp")
 
 app = Flask(__name__)
 
-# ─── In-memory recent store ───────────────────────────────────────────────────
 recent_store = {}
 
 # ─── Preset storage ───────────────────────────────────────────────────────────
@@ -71,6 +71,61 @@ def save_device_presets(data):
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(DEVICE_PRESETS_FILE, "w") as f:
         json.dump(data, f, indent=2)
+
+# ─── Device groups persistence ────────────────────────────────────────────────
+
+def load_groups():
+    if os.path.exists(GROUPS_FILE):
+        with open(GROUPS_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_groups(groups):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(GROUPS_FILE, 'w') as f:
+        json.dump(groups, f, indent=2)
+
+def get_mac_from_ip(ip):
+    """Query speaker info endpoint to resolve MAC address from IP."""
+    try:
+        import urllib.request
+        url = f"http://{ip}:8090/info"
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            xml = resp.read().decode('utf-8')
+            match = re.search(r'<macAddress>([^<]+)</macAddress>', xml)
+            if match:
+                return match.group(1).strip().upper()
+    except Exception as e:
+        log.info(f"Could not resolve MAC for {ip}: {e}")
+    return None
+
+def build_group_xml(group_id, master_id, name, roles):
+    roles_xml = ''.join(
+        f'<groupRole><deviceId>{r["deviceId"]}</deviceId>'
+        f'<role>{r["role"]}</role></groupRole>'
+        for r in roles
+    )
+    return (
+        f'<?xml version="1.0" encoding="UTF-8"?>'
+        f'<group id="{group_id}">'
+        f'<masterDeviceId>{master_id}</masterDeviceId>'
+        f'<name>{name}</name>'
+        f'<roles>{roles_xml}</roles>'
+        f'</group>'
+    )
+
+def parse_group_roles(xml):
+    roles = []
+    for block in re.findall(r'<groupRole>(.*?)</groupRole>', xml, re.DOTALL):
+        device_id = re.search(r'<deviceId>(.*?)</deviceId>', block)
+        role      = re.search(r'<role>(.*?)</role>', block)
+        if device_id and role:
+            roles.append({
+                'deviceId': device_id.group(1).strip(),
+                'role':     role.group(1).strip()
+            })
+    return roles
+
 
 # ─── UPnP XML definitions ─────────────────────────────────────────────────────
 
@@ -386,6 +441,42 @@ def get_ma_stream_url(ma_uri):
                 f"TuneIn opml returned no stream for: {station_id}"
             )
             return None
+        
+        if "radioparadise" in ma_uri:
+            parts      = ma_uri.rstrip("/").split("/")
+            channel_id = parts[-1]
+            log.info(f"Resolving Radio Paradise channel: {channel_id}")
+            try:
+                api_url = f"https://api.radioparadise.com/api/info?chan={channel_id}&format=json"
+                resp    = requests.get(api_url, timeout=10)
+                if resp.status_code == 200:
+                    data       = resp.json()
+                    stream_url = data.get("stream_url") or data.get("url")
+                    if stream_url and stream_url.startswith("http"):
+                        log.info(f"Radio Paradise resolved: {channel_id} → {stream_url}")
+                        return stream_url
+            except Exception as e:
+                log.warning(f"Radio Paradise API failed: {e}")
+            log.warning(f"Could not resolve Radio Paradise channel: {channel_id}")
+            return None
+
+        if "somafm" in ma_uri:
+            parts      = ma_uri.rstrip("/").split("/")
+            channel_id = parts[-1].lower()
+            log.info(f"Resolving SomaFM channel: {channel_id}")
+            try:
+                pls_url = f"https://somafm.com/{channel_id}.pls"
+                resp    = requests.get(pls_url, timeout=10)
+                if resp.status_code == 200:
+                    for line in resp.text.splitlines():
+                        if line.lower().startswith("file1="):
+                            stream_url = line.split("=", 1)[1].strip()
+                            log.info(f"SomaFM resolved: {channel_id} → {stream_url}")
+                            return stream_url
+            except Exception as e:
+                log.warning(f"SomaFM PLS fetch failed: {e}")
+            return None
+
 
         if MA_TOKEN:
             headers = {
@@ -546,98 +637,90 @@ def streaming_account_full(account_id):
     now            = "2026-01-01T00:00:00.000+00:00"
     device_presets = load_device_presets()
 
-    # Build device list from recent_store if available
-    # otherwise create a default device entry for the requester
+    # Resolve requesting speaker MAC from its IP
+    requester_mac = get_mac_from_ip(request.remote_addr)
+    log.info(
+        f"Account full: resolved MAC={requester_mac} "
+        f"for {request.remote_addr}"
+    )
+
     if recent_store:
-        devices_xml = ""
-        for device_id, device_recents in recent_store.items():
-            recents_items_xml = ""
-            for rid, item in list(device_recents.items())[-5:]:
-                name        = escape_xml(item.get("name", ""))
-                last_played = item.get("lastplayedat", now)
-                location    = escape_xml(item.get("location", ""))
-                ctype       = escape_xml(
-                    item.get("contentItemType", "stationurl")
-                )
-                recents_items_xml += (
-                    f'      <recent id="{rid}">\n'
-                    f'        <contentItemType>{ctype}</contentItemType>\n'
-                    f'        <createdOn>{now}</createdOn>\n'
-                    f'        <lastplayedat>{last_played}</lastplayedat>\n'
-                    f'        <location>{location}</location>\n'
-                    f'        <name>{name}</name>\n'
-                    f'        <source id="ST_LIR_001" type="Audio">\n'
-                    f'          <createdOn>{now}</createdOn>\n'
-                    f'          <credential type="token">streamtouch-lir-token</credential>\n'
-                    f'          <name></name>\n'
-                    f'          <sourceproviderid>11</sourceproviderid>\n'
-                    f'          <sourcename>LOCAL_INTERNET_RADIO</sourcename>\n'
-                    f'          <sourceSettings/>\n'
-                    f'          <updatedOn>{now}</updatedOn>\n'
-                    f'          <username></username>\n'
-                    f'        </source>\n'
-                    f'        <sourceid>ST_LIR_001</sourceid>\n'
-                    f'        <updatedOn>{now}</updatedOn>\n'
-                    f'      </recent>\n'
-                )
-
-            # Look up presets by device MAC
-            slots       = device_presets.get(device_id, {})
-            presets_xml = ""
-            for slot, preset in slots.items():
-                presets_xml += build_preset_xml(slot, preset)
-            presets_block = (
-                f'      <presets>\n{presets_xml}      </presets>\n'
-                if presets_xml else ''
+        # Use recents from memory — filter to requesting speaker only
+        device_recents    = recent_store.get(requester_mac, {})
+        recents_items_xml = ""
+        for rid, item in list(device_recents.items())[-5:]:
+            name        = escape_xml(item.get("name", ""))
+            last_played = item.get("lastplayedat", now)
+            location    = escape_xml(item.get("location", ""))
+            ctype       = escape_xml(
+                item.get("contentItemType", "stationurl")
+            )
+            recents_items_xml += (
+                f'      <recent id="{rid}">\n'
+                f'        <contentItemType>{ctype}</contentItemType>\n'
+                f'        <createdOn>{now}</createdOn>\n'
+                f'        <lastplayedat>{last_played}</lastplayedat>\n'
+                f'        <location>{location}</location>\n'
+                f'        <name>{name}</name>\n'
+                f'        <source id="ST_LIR_001" type="Audio">\n'
+                f'          <createdOn>{now}</createdOn>\n'
+                f'          <credential type="token">streamtouch-lir-token</credential>\n'
+                f'          <name></name>\n'
+                f'          <sourceproviderid>11</sourceproviderid>\n'
+                f'          <sourcename>LOCAL_INTERNET_RADIO</sourcename>\n'
+                f'          <sourceSettings/>\n'
+                f'          <updatedOn>{now}</updatedOn>\n'
+                f'          <username></username>\n'
+                f'        </source>\n'
+                f'        <sourceid>ST_LIR_001</sourceid>\n'
+                f'        <updatedOn>{now}</updatedOn>\n'
+                f'      </recent>\n'
             )
 
-            devices_xml += (
-                f'    <device deviceid="{device_id}">\n'
-                f'      <createdOn>{now}</createdOn>\n'
-                f'      <ipaddress>{request.remote_addr}</ipaddress>\n'
-                f'      <name></name>\n'
-                f'      <updatedOn>{now}</updatedOn>\n'
-                f'{presets_block}'
-                f'      <recents>\n'
-                f'{recents_items_xml}'
-                f'      </recents>\n'
-                f'    </device>\n'
-            )
+        slots       = device_presets.get(requester_mac, {})
+        presets_xml = ""
+        for slot, preset in slots.items():
+            presets_xml += build_preset_xml(slot, preset)
+        presets_block = (
+            f'      <presets>\n{presets_xml}      </presets>\n'
+            if presets_xml else ''
+        )
+
+        devices_xml = (
+            f'    <device deviceid="{requester_mac or "unknown"}">\n'
+            f'      <createdOn>{now}</createdOn>\n'
+            f'      <ipaddress>{request.remote_addr}</ipaddress>\n'
+            f'      <name></name>\n'
+            f'      <updatedOn>{now}</updatedOn>\n'
+            f'{presets_block}'
+            f'      <recents>\n'
+            f'{recents_items_xml}'
+            f'      </recents>\n'
+            f'    </device>\n'
+        )
+
     else:
-        # No recents in memory — look up presets across all known devices
-        # The requesting speaker's MAC is not known here from IP alone
-        # so include ALL stored device presets as separate device entries
-        # This covers the cold start case after SLC restart
-        devices_xml = ""
-        if device_presets:
-            for device_id, slots in device_presets.items():
-                presets_xml = ""
-                for slot, preset in slots.items():
-                    presets_xml += build_preset_xml(slot, preset)
-                presets_block = (
-                    f'      <presets>\n{presets_xml}      </presets>\n'
-                    if presets_xml else ''
-                )
-                devices_xml += (
-                    f'    <device deviceid="{device_id}">\n'
-                    f'      <createdOn>{now}</createdOn>\n'
-                    f'      <ipaddress>{request.remote_addr}</ipaddress>\n'
-                    f'      <name></name>\n'
-                    f'      <updatedOn>{now}</updatedOn>\n'
-                    f'{presets_block}'
-                    f'      <recents/>\n'
-                    f'    </device>\n'
-                )
-        else:
-            devices_xml = (
-                f'    <device deviceid="DEFAULT">\n'
-                f'      <createdOn>{now}</createdOn>\n'
-                f'      <ipaddress>{request.remote_addr}</ipaddress>\n'
-                f'      <name></name>\n'
-                f'      <updatedOn>{now}</updatedOn>\n'
-                f'      <recents/>\n'
-                f'    </device>\n'
-            )
+        # Cold start — no recents in memory
+        # Use resolved MAC to return only this speaker's presets
+        slots       = device_presets.get(requester_mac, {}) if requester_mac else {}
+        presets_xml = ""
+        for slot, preset in slots.items():
+            presets_xml += build_preset_xml(slot, preset)
+        presets_block = (
+            f'      <presets>\n{presets_xml}      </presets>\n'
+            if presets_xml else ''
+        )
+
+        devices_xml = (
+            f'    <device deviceid="{requester_mac or "unknown"}">\n'
+            f'      <createdOn>{now}</createdOn>\n'
+            f'      <ipaddress>{request.remote_addr}</ipaddress>\n'
+            f'      <name></name>\n'
+            f'      <updatedOn>{now}</updatedOn>\n'
+            f'{presets_block}'
+            f'      <recents/>\n'
+            f'    </device>\n'
+        )
 
     response_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
@@ -981,10 +1064,113 @@ def streaming_account_preset(account_id, device_id, button_number):
     )
 
 @app.route(
+    "/streaming/account/<account_id>/group/",
+    methods=["POST"]
+)
+def create_device_group(account_id):
+    body   = request.data.decode('utf-8')
+    master = re.search(r'<masterDeviceId>(.*?)</masterDeviceId>', body)
+    name   = re.search(r'<name>(.*?)</name>', body)
+    master_id  = master.group(1).strip() if master else ""
+    group_name = name.group(1).strip()   if name   else "Stereo Pair"
+    roles      = parse_group_roles(body)
+
+    groups = load_groups()
+
+    # Check device not already in a group
+    device_ids = [r['deviceId'] for r in roles]
+    for gid, g in groups.items():
+        existing = [r['deviceId'] for r in g['roles']]
+        for did in device_ids:
+            if did in existing:
+                return Response(
+                    f'<?xml version="1.0" encoding="UTF-8"?>'
+                    f'<error><status-code>4041</status-code>'
+                    f'<message>Device {did} already belongs to a group</message></error>',
+                    status=400,
+                    mimetype="application/vnd.bose.streaming-v1.2+xml"
+                )
+
+    import random
+    group_id = str(random.randint(1000000, 9999999))
+    groups[group_id] = {
+        'id':           group_id,
+        'masterDeviceId': master_id,
+        'name':         group_name,
+        'roles':        roles
+    }
+    save_groups(groups)
+    log.info(f"Group created: {group_id} name={group_name} master={master_id}")
+
+    return Response(
+        build_group_xml(group_id, master_id, group_name, roles),
+        status=201,
+        mimetype="application/vnd.bose.streaming-v1.2+xml"
+    )
+
+@app.route(
+    "/streaming/account/<account_id>/group/<group_id>",
+    methods=["DELETE"]
+)
+def delete_device_group(account_id, group_id):
+    groups = load_groups()
+    if group_id not in groups:
+        return Response(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<status><message>Device Group not found</message>'
+            '<status-code>4040</status-code></status>',
+            status=400,
+            mimetype="application/vnd.bose.streaming-v1.2+xml"
+        )
+    del groups[group_id]
+    save_groups(groups)
+    log.info(f"Group deleted: {group_id}")
+    return Response('', status=200, mimetype="application/vnd.bose.streaming-v1.2+xml")
+
+@app.route(
+    "/streaming/account/<account_id>/group/<group_id>",
+    methods=["PUT"]
+)
+def update_device_group(account_id, group_id):
+    groups = load_groups()
+    if group_id not in groups:
+        return Response(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<status><message>Device Group not found</message>'
+            '<status-code>4040</status-code></status>',
+            status=400,
+            mimetype="application/vnd.bose.streaming-v1.2+xml"
+        )
+    body   = request.data.decode('utf-8')
+    master = re.search(r'<masterDeviceId>(.*?)</masterDeviceId>', body)
+    name   = re.search(r'<name>(.*?)</name>', body)
+    if master:
+        groups[group_id]['masterDeviceId'] = master.group(1).strip()
+    if name:
+        groups[group_id]['name'] = name.group(1).strip()
+    save_groups(groups)
+
+    g   = groups[group_id]
+    xml = build_group_xml(g['id'], g['masterDeviceId'], g['name'], g['roles'])
+    return Response(xml, status=200, mimetype="application/vnd.bose.streaming-v1.2+xml")
+
+@app.route(
     "/streaming/account/<account_id>/device/<device_id>/group/",
     methods=["GET"]
 )
 def streaming_account_device_group(account_id, device_id):
+    groups = load_groups()
+    for gid, g in groups.items():
+        for role in g['roles']:
+            if role['deviceId'].upper() == device_id.upper():
+                xml = build_group_xml(g['id'], g['masterDeviceId'], g['name'], g['roles'])
+                log.info(f"Group poll: device {device_id} is in group {gid}")
+                return Response(
+                    xml,
+                    status=200,
+                    mimetype="application/vnd.bose.streaming-v1.2+xml"
+                )
+    log.info(f"Group poll: device {device_id} not in any group")
     return Response(
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><group/>',
         status=200,
@@ -1516,4 +1702,6 @@ if __name__ == "__main__":
     threading.Thread(target=handle_ssdp_msearch, daemon=True).start()
 
     app.run(host="0.0.0.0", port=SHIM_PORT, debug=False)
+
+
 
